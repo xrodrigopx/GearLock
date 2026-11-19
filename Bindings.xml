@@ -1,0 +1,5 @@
+<Bindings>
+  <Binding name="GEARLOCK_TOGGLE" category="ADDONS">
+    GearLock_ToggleHovered()
+  </Binding>
+</Bindings>

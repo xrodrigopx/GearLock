@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: GearLock
+## Notes: Lock items so they are never sold by accident. Auto-buyback if a locked item is sold anyway.
+## Author: Rodrigo Perdomo
+## Version: 1.0
+## SavedVariables: GearLockDB
+
+GearLock.lua
