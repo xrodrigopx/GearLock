@@ -11,7 +11,9 @@ local attempts = 0
 BINDING_HEADER_GEARLOCK = "GearLock"
 BINDING_NAME_GEARLOCK_TOGGLE = "Lock / unlock the item under the cursor"
 
+local pending = {}   -- itemIDs whose sale we detected via UseContainerItem
 local function Print(msg) print(PREFIX .. msg) end
+local function Log(msg) if db and db.verbose then print(PREFIX .. "|cff999999[verbose]|r " .. msg) end end
 
 local function ItemIDFromLink(link)
   if type(link) ~= "string" then return nil end
@@ -227,19 +229,12 @@ end
 RefreshBags = function()
   if refreshQueued then return end
   refreshQueued = true
-  C_Timer.After(0.05, DoRefresh)
+  C_Timer.After(0.05, function()
+    local ok, err = pcall(DoRefresh)
+    if not ok and db then Print("|cffff5555bag refresh error:|r " .. tostring(err)) end
+  end)
 end
 
-local function Debug()
-  DoRefresh()
-  Print(("debug: path=%s, frames=%d, buttons=%d, locked=%d, combined bags=%s")
-    :format(lastStats.path, lastStats.frames, lastStats.buttons, lastStats.locked,
-            tostring(ContainerFrameCombinedBags ~= nil)))
-end
-
----------------------------------------------------------------------------
--- Automatic buyback of locked items
----------------------------------------------------------------------------
 local function NumBuyback()
   if GetNumBuybackItems then return GetNumBuybackItems() end
   if C_MerchantFrame and C_MerchantFrame.GetNumBuybackItems then return C_MerchantFrame.GetNumBuybackItems() end
@@ -264,13 +259,19 @@ local function BuybackCounts()
 end
 
 local function CheckBuyback()
-  if not (MerchantFrame and MerchantFrame:IsShown()) then return end
-  if attempts >= 30 then return end
+  if not (MerchantFrame and MerchantFrame:IsShown()) then Log("CheckBuyback: merchant not shown"); return end
+  if attempts >= 30 then Log("CheckBuyback: attempt limit reached"); return end
   local counts = BuybackCounts()
-  for i = 1, NumBuyback() do
+  local n = NumBuyback()
+  Log(("CheckBuyback: %d item(s) in buyback list"):format(n))
+  for i = 1, n do
     local id = BuybackID(i)
-    if id and ProtectionReason(id) and (counts[id] or 0) > (baseline[id] or 0) then
+    local reason = id and ProtectionReason(id)
+    Log(("  buyback[%d] id=%s locked=%s count=%s baseline=%s pending=%s"):format(
+      i, tostring(id), tostring(reason), tostring(id and counts[id]), tostring(id and baseline[id]), tostring(id and pending[id])))
+    if id and reason and (pending[id] or (counts[id] or 0) > (baseline[id] or 0)) then
       attempts = attempts + 1
+      pending[id] = nil
       Print("Sold " .. ItemLinkByID(id) .. " (locked): buying it back...")
       BuybackItem(i)
       C_Timer.After(0.4, CheckBuyback)
@@ -279,6 +280,28 @@ local function CheckBuyback()
   end
 end
 
+local function Debug()
+  local ok, err = pcall(DoRefresh)
+  if not ok then Print("|cffff5555ERROR in refresh:|r " .. tostring(err)) end
+  local n = 0
+  for _, v in pairs(db.items) do if v == true then n = n + 1 end end
+  local hid = GetHoveredItemID()
+  Print("debug v" .. (C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata("GearLock", "Version") or "?"))
+  Print(("bags: path=%s, frames=%d, buttons=%d, locked shown=%d, combined=%s, container=%s")
+    :format(lastStats.path, lastStats.frames, lastStats.buttons, lastStats.locked,
+            tostring(ContainerFrameCombinedBags ~= nil), tostring(ContainerFrameContainer ~= nil)))
+  Print(("api: BuybackItem=%s GetNumBuybackItems=%s C_MerchantFrame.GetBuybackItemID=%s GetContainerItemID=%s TooltipUtil=%s")
+    :format(type(BuybackItem), type(GetNumBuybackItems),
+            type(C_MerchantFrame and C_MerchantFrame.GetBuybackItemID), type(C_Container and C_Container.GetContainerItemID),
+            type(TooltipUtil and TooltipUtil.GetDisplayedItem)))
+  Print(("locked manually: %d | hovered item: %s (%s) | merchant open: %s | buyback items: %d")
+    :format(n, tostring(hid), tostring(hid and ProtectionReason(hid)), tostring(MerchantFrame and MerchantFrame:IsShown() or false), NumBuyback()))
+  Print("Tip: /gl verbose  shows what happens when you sell an item.")
+end
+
+---------------------------------------------------------------------------
+-- Automatic buyback of locked items
+---------------------------------------------------------------------------
 ---------------------------------------------------------------------------
 -- Tooltip
 ---------------------------------------------------------------------------
@@ -304,7 +327,7 @@ f:RegisterEvent("MERCHANT_UPDATE")
 f:RegisterEvent("BAG_UPDATE_DELAYED")
 f:RegisterEvent("EQUIPMENT_SETS_CHANGED")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
-f:SetScript("OnEvent", function(_, event, arg1)
+local function HandleEvent(event, arg1)
   if event == "ADDON_LOADED" then
     if arg1 ~= "GearLock" then return end
     GearLockDB = GearLockDB or {}
@@ -313,19 +336,44 @@ f:SetScript("OnEvent", function(_, event, arg1)
     if db.protectSets == nil then db.protectSets = true end
     if db.protectGear == nil then db.protectGear = false end
     db.minQuality = db.minQuality or 2
-    HookTooltip()
+    local ok, err = pcall(HookTooltip)
+    if not ok then Print("|cffff5555tooltip hook failed:|r " .. tostring(err)) end
     for _, fn in ipairs({ "ToggleAllBags", "OpenAllBags", "ToggleBackpack", "ToggleBag", "OpenBag", "OpenBackpack" }) do
       if _G[fn] then hooksecurefunc(fn, function() C_Timer.After(0.05, RefreshBags) end) end
     end
+    -- Detect sales: right-clicking an item while a vendor is open calls UseContainerItem.
+    if C_Container and C_Container.UseContainerItem then
+      hooksecurefunc(C_Container, "UseContainerItem", function(bag, slot)
+        if not (MerchantFrame and MerchantFrame:IsShown()) then return end
+        local id = C_Container.GetContainerItemID(bag, slot)
+        Log(("UseContainerItem bag=%s slot=%s id=%s locked=%s"):format(tostring(bag), tostring(slot), tostring(id), tostring(id and ProtectionReason(id))))
+        if id and ProtectionReason(id) then
+          pending[id] = true
+          C_Timer.After(0.3, CheckBuyback)
+          C_Timer.After(1.0, CheckBuyback)
+          C_Timer.After(2.5, function() pending[id] = nil end)
+        end
+      end)
+    else
+      Print("|cffff5555C_Container.UseContainerItem not found: sale detection limited.|r")
+    end
   elseif event == "MERCHANT_SHOW" then
     attempts = 0
+    wipe(pending)
     baseline = BuybackCounts()
+    Log("MERCHANT_SHOW: buyback list has " .. NumBuyback() .. " item(s)")
   elseif event == "MERCHANT_UPDATE" or event == "BAG_UPDATE_DELAYED" then
+    Log("event " .. event)
     CheckBuyback()
     RefreshBags()
   elseif event == "EQUIPMENT_SETS_CHANGED" or event == "PLAYER_ENTERING_WORLD" then
     RefreshBags()
   end
+end
+
+f:SetScript("OnEvent", function(_, event, arg1)
+  local ok, err = pcall(HandleEvent, event, arg1)
+  if not ok then Print("|cffff5555error in " .. event .. ":|r " .. tostring(err)) end
 end)
 
 ---------------------------------------------------------------------------
@@ -338,7 +386,8 @@ local function Help()
   print("  /gl sets           - toggle protection for Equipment Manager set items (now: " .. (db.protectSets and "ON" or "OFF") .. ")")
   print("  /gl all            - toggle \"lock all gear\" mode (now: " .. (db.protectGear and "ON" or "OFF") .. ")")
   print("  /gl quality N      - minimum quality for that mode (2 = green, 3 = blue, 4 = epic). Now: " .. db.minQuality)
-  print("  /gl debug          - diagnostic info about detected bag slots")
+  print("  /gl debug          - diagnostic info about detected bag slots and APIs")
+  print("  /gl verbose        - toggle detailed logging (shows what happens when you sell)")
   print("  Alt + click on an item in your bags also locks/unlocks it.")
   print("  You can also bind a key: Options > Keybindings > AddOns > GearLock.")
 end
@@ -363,6 +412,9 @@ SlashCmdList["GEARLOCK"] = function(msg)
     if n == 0 then Print("no manually locked items.") else Print(n .. " locked item(s).") end
   elseif cmd == "debug" then
     Debug()
+  elseif cmd == "verbose" then
+    db.verbose = not db.verbose
+    Print("verbose logging: " .. (db.verbose and "|cff55ff55ON|r" or "|cffff5555OFF|r"))
   elseif cmd == "sets" then
     db.protectSets = not db.protectSets
     Print("lock Equipment Manager set items: " .. (db.protectSets and "|cff55ff55ON|r" or "|cffff5555OFF|r"))
